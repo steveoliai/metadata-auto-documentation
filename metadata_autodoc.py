@@ -1,10 +1,14 @@
+
 #!/usr/bin/env python3
 """
-Metadata Auto-Doc v0.3
-- HTML output
-- Mermaid ERD
+Metadata Auto-Doc v0.4
+- HTML & Markdown output
+- Mermaid ERD (safe name sanitization; optional via --no-erd)
 - Change tracking across runs with snapshots
 - Optional Slack summary for significant diffs
+- Postgres: includes partitioned tables; consolidated stats query (fast, safe)
+- BigQuery: stable clustering ordering; clearer partitioning text
+- CLI niceties: include/exclude tables, fail-on-significant, flag description diffs
 
 Usage examples:
   Postgres:
@@ -20,9 +24,10 @@ Usage examples:
       --md docs.md --html docs.html --json snapshot.json \
       --snapshot-dir ./_snapshots
 """
-import argparse, os, sys, datetime, json, math, glob
-from typing import Any, Dict, List, Optional, Tuple
+import argparse, os, sys, datetime, json, glob, re
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
+# --------- Lazy imports (optional deps) ----------
 def _maybe_import(name):
     try:
         return __import__(name)
@@ -52,28 +57,47 @@ def pct_change(cur: Optional[float], base: Optional[float]) -> Optional[float]:
     if base == 0: return None
     return ((cur - base) / base) * 100.0
 
+def _mm_sanitize(name: str) -> str:
+    """Sanitize names for Mermaid erDiagram block."""
+    s = re.sub(r'[^a-zA-Z0-9_]', '_', name or '')
+    if not s:
+        s = 'unnamed'
+    if s[0].isdigit():
+        s = f"t_{s}"
+    return s
+
+def _compile_filters(include: Optional[str], exclude: Optional[str]):
+    inc = re.compile(include) if include else None
+    exc = re.compile(exclude) if exclude else None
+    def _ok(name: str) -> bool:
+        if inc and not inc.search(name): return False
+        if exc and exc.search(name): return False
+        return True
+    return _ok
+
 # ---------------------- Collectors ----------------------
-def pg_collect(conn: str, schema: str) -> Dict[str, Any]:
+def pg_collect(conn: str, schema: str, ok_table) -> Dict[str, Any]:
     if sqlalchemy is None or pd is None:
         raise RuntimeError("SQLAlchemy and pandas required for PostgreSQL.")
     eng = sqlalchemy.create_engine(conn)
     info: Dict[str, Any] = {"flavor": "postgres", "schema": schema, "tables": {}}
 
+    # Columns
     cols_sql = """
-    SELECT c.table_name, c.column_name, c.data_type, c.is_nullable,
-           c.column_default
+    SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_default, c.ordinal_position
     FROM information_schema.columns c
     WHERE c.table_schema = %(schema)s
     ORDER BY c.table_name, c.ordinal_position
     """
     cols = pd.read_sql_query(cols_sql, eng, params={"schema": schema})
 
+    # Table & column comments
     tbl_comments_sql = """
     SELECT c.relname AS table_name, d.description AS comment
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     LEFT JOIN pg_description d ON d.objoid = c.oid AND d.objsubid = 0
-    WHERE n.nspname = %(schema)s AND c.relkind = 'r'
+    WHERE n.nspname = %(schema)s AND c.relkind IN ('r','p')
     """
     tbl_comments = pd.read_sql_query(tbl_comments_sql, eng, params={"schema": schema})
 
@@ -83,12 +107,13 @@ def pg_collect(conn: str, schema: str) -> Dict[str, Any]:
     JOIN pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
     LEFT JOIN pg_description d ON d.objoid = c.oid AND d.objsubid = a.attnum
-    WHERE n.nspname = %(schema)s AND c.relkind = 'r'
+    WHERE n.nspname = %(schema)s AND c.relkind IN ('r','p')
     """
     col_comments = pd.read_sql_query(col_comments_sql, eng, params={"schema": schema})
 
+    # Primary keys
     pk_sql = """
-    SELECT k.table_name, k.column_name
+    SELECT k.table_name, k.column_name, k.ordinal_position
     FROM information_schema.table_constraints t
     JOIN information_schema.key_column_usage k
       ON t.constraint_name = k.constraint_name
@@ -98,8 +123,10 @@ def pg_collect(conn: str, schema: str) -> Dict[str, Any]:
     """
     pks = pd.read_sql_query(pk_sql, eng, params={"schema": schema})
 
+    # Foreign keys
     fk_sql = """
-    SELECT tc.table_name, kcu.column_name,
+    SELECT tc.table_name,
+           kcu.column_name,
            ccu.table_name AS foreign_table_name,
            ccu.column_name AS foreign_column_name
     FROM information_schema.table_constraints AS tc
@@ -110,44 +137,51 @@ def pg_collect(conn: str, schema: str) -> Dict[str, Any]:
       ON ccu.constraint_name = tc.constraint_name
      AND ccu.table_schema = tc.table_schema
     WHERE tc.table_schema = %(schema)s AND tc.constraint_type = 'FOREIGN KEY'
-    ORDER BY tc.table_name, kcu.ordinal_position
     """
     fks = pd.read_sql_query(fk_sql, eng, params={"schema": schema})
 
+    # Indexes
     idx_sql = """
     SELECT schemaname AS schema_name, tablename AS table_name, indexname, indexdef
     FROM pg_indexes WHERE schemaname = %(schema)s
     """
     idx = pd.read_sql_query(idx_sql, eng, params={"schema": schema})
 
-    rowcount_sql = """
-    SELECT relname AS table_name, n_live_tup AS approx_rows
-    FROM pg_stat_user_tables WHERE schemaname = %(schema)s
+    # Consolidated stats: include ordinary and partitioned tables
+    tbl_sql = """
+    SELECT
+      c.relname AS table_name,
+      COALESCE(s.n_live_tup, 0) AS approx_rows,
+      pg_total_relation_size(c.oid) AS size_bytes
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+    WHERE n.nspname = %(schema)s
+      AND c.relkind IN ('r','p')
     """
-    rowcounts = pd.read_sql_query(rowcount_sql, eng, params={"schema": schema})
-
-    size_rows = []
-    for t in rowcounts["table_name"].tolist():
-        size_sql = f"SELECT pg_total_relation_size('{schema}.{t}') AS size_bytes"
-        s = pd.read_sql_query(size_sql, eng).iloc[0,0]
-        size_rows.append({"table_name": t, "size_bytes": int(s) if s is not None else None})
-    sizes = pd.DataFrame(size_rows)
+    tbl_stats = pd.read_sql_query(tbl_sql, eng, params={"schema": schema})
 
     eng.dispose()
 
-    for tname in sorted(cols["table_name"].unique()):
-        tcols = cols[cols["table_name"] == tname]
+    # Build per-table info
+    for tname in sorted(set(cols["table_name"].unique())):
+        if not ok_table(tname): 
+            continue
+        tcols = cols[cols["table_name"] == tname].sort_values("ordinal_position")
         tcol_comments = col_comments[col_comments["table_name"] == tname]
-        tpk = pks[pks["table_name"] == tname]["column_name"].tolist()
-        tfk = fks[fks["table_name"] == tname][["column_name","foreign_table_name","foreign_column_name"]]
-        tidx = idx[idx["table_name"] == tname][["indexname","indexdef"]]
-        trow = rowcounts[rowcounts["table_name"] == tname]
-        tsize = sizes[sizes["table_name"] == tname]
+        tpk = pks[pks["table_name"] == tname].sort_values("ordinal_position")["column_name"].tolist()
+        tfk = fks[fks["table_name"] == tname][["column_name","foreign_table_name","foreign_column_name"]]\
+                .sort_values(["column_name","foreign_table_name","foreign_column_name"])
+        tidx = idx[idx["table_name"] == tname][["indexname","indexdef"]].sort_values("indexname")
+        tstat = tbl_stats[tbl_stats["table_name"] == tname]
         tcomment = tbl_comments[tbl_comments["table_name"] == tname]["comment"]
+
+        approx_rows = int(tstat["approx_rows"].iloc[0]) if not tstat.empty else None
+        size_bytes  = int(tstat["size_bytes"].iloc[0])  if not tstat.empty else None
         info["tables"][tname] = {
             "comment": (tcomment.iloc[0] if not tcomment.empty else None),
-            "approx_rows": int(trow["approx_rows"].iloc[0]) if not trow.empty else None,
-            "size_bytes": int(tsize["size_bytes"].iloc[0]) if not tsize.empty else None,
+            "approx_rows": approx_rows,
+            "size_bytes": size_bytes,
             "primary_key": tpk,
             "foreign_keys": tfk.to_dict(orient="records"),
             "indexes": tidx.to_dict(orient="records"),
@@ -164,26 +198,34 @@ def pg_collect(conn: str, schema: str) -> Dict[str, Any]:
             })
     return info
 
-def bq_collect(project: str, dataset: str) -> Dict[str, Any]:
+def bq_collect(project: str, dataset: str, ok_table) -> Dict[str, Any]:
     if bigquery_mod is None:
         raise RuntimeError("google-cloud-bigquery required for BigQuery.")
     client = bigquery_mod.Client(project=project)
     info: Dict[str, Any] = {"flavor": "bigquery", "project": project, "dataset": dataset, "tables": {}}
     for t in client.list_tables(f"{project}.{dataset}"):
+        if not ok_table(t.table_id):
+            continue
         table = client.get_table(t)
         cols = []
         for f in table.schema:
             cols.append({
                 "name": f.name,
                 "data_type": f.field_type,
-                "mode": f.mode,
-                "description": f.description
+                "mode": getattr(f, "mode", None),
+                "description": getattr(f, "description", None)
             })
+        part_type = None
+        part_field = None
+        if getattr(table, "time_partitioning", None):
+            if table.time_partitioning.type_:
+                part_type = str(table.time_partitioning.type_)
+            part_field = table.time_partitioning.field  # may be None (ingestion-time)
         info["tables"][t.table_id] = {
-            "description": table.description,
-            "partitioning": str(table.time_partitioning.type_) if table.time_partitioning else None,
-            "partition_field": table.time_partitioning.field if table.time_partitioning else None,
-            "clustering_fields": list(table.clustering_fields) if table.clustering_fields else [],
+            "description": getattr(table, "description", None),
+            "partitioning": part_type,
+            "partition_field": part_field,
+            "clustering_fields": sorted(list(table.clustering_fields)) if getattr(table, "clustering_fields", None) else [],
             "num_rows": int(table.num_rows),
             "table_type": table.table_type,
             "columns": cols
@@ -202,25 +244,24 @@ def _map_dtype(dtype: str) -> str:
 def mermaid_from_pg(meta: Dict[str, Any]) -> str:
     lines = ["erDiagram"]
     for tname, tinfo in meta["tables"].items():
-        lines.append(f"  {tname} {{")
+        lines.append(f"  {_mm_sanitize(tname)} {{")
         for c in tinfo["columns"]:
-            lines.append(f"    {_map_dtype(c.get('data_type',''))} {c['name']}")
+            lines.append(f"    {_map_dtype(c.get('data_type',''))} {_mm_sanitize(c['name'])}")
         lines.append("  }")
     # relationships
     for tname, tinfo in meta["tables"].items():
         for fk in tinfo.get("foreign_keys", []):
             ft = fk["foreign_table_name"]
             if ft in meta["tables"]:
-                # simple cardinality
-                lines.append(f"  {ft} ||--o{{ {tname} : FK")
+                lines.append(f"  {_mm_sanitize(ft)} ||--o{{ {_mm_sanitize(tname)} : FK")
     return "\n".join(lines)
 
 def mermaid_from_bq(meta: Dict[str, Any]) -> str:
     lines = ["erDiagram"]
     for tname, tinfo in meta["tables"].items():
-        lines.append(f"  {tname} {{")
+        lines.append(f"  {_mm_sanitize(tname)} {{")
         for c in tinfo["columns"]:
-            lines.append(f"    {_map_dtype(c.get('data_type',''))} {c['name']}")
+            lines.append(f"    {_map_dtype(c.get('data_type',''))} {_mm_sanitize(c['name'])}")
         lines.append("  }")
     return "\n".join(lines)
 
@@ -234,6 +275,8 @@ def diff_meta(cur: Dict[str, Any], base: Dict[str, Any], thresholds: Dict[str, A
     base_tables = set(base["tables"].keys())
     out["tables_added"] = sorted(list(cur_tables - base_tables))
     out["tables_removed"] = sorted(list(base_tables - cur_tables))
+
+    flag_desc = thresholds.get("flag_desc", False)
 
     # Table-by-table comparison
     for t in sorted(cur_tables & base_tables):
@@ -250,11 +293,16 @@ def diff_meta(cur: Dict[str, Any], base: Dict[str, Any], thresholds: Dict[str, A
             changed["columns_removed"].append(name)
         for name in cur_cols.keys() & base_cols.keys():
             cc, bc = cur_cols[name], base_cols[name]
-            # different attributes
             diffs = {}
-            for k in ["data_type", "nullable", "default", "comment", "mode", "description"]:
+            # always track structural diffs
+            for k in ["data_type", "nullable", "default", "mode"]:
                 if cc.get(k) != bc.get(k):
                     diffs[k] = {"baseline": bc.get(k), "current": cc.get(k)}
+            # only include description/comment diffs when requested
+            if flag_desc:
+                for k in ["comment","description"]:
+                    if cc.get(k) != bc.get(k):
+                        diffs[k] = {"baseline": bc.get(k), "current": cc.get(k)}
             if diffs:
                 changed["columns_changed"].append({"name": name, "diffs": diffs})
 
@@ -322,8 +370,12 @@ def render_markdown(meta: Dict[str, Any], erd_block: str, diffs: Optional[Dict[s
                 if ch["columns_removed"]:
                     lines.append(f"  - Columns removed: `{', '.join(ch['columns_removed'])}`")
                 for cc in ch["columns_changed"]:
-                    diffs_str = ", ".join([f"{k}: {v['baseline']} → {v['current']}" for k, v in cc["diffs"].items()])
-                    lines.append(f"  - Column changed: `{cc['name']}` - {diffs_str}")
+                    parts = []
+                    for k, v in cc["diffs"].items():
+                        b = v['baseline']
+                        c = v['current']
+                        parts.append(f"{k}: {b} → {c}")
+                    lines.append(f"  - Column changed: `{cc['name']}` - {', '.join(parts)}")
                 if ch["keys_changed"]:
                     lines.append("  - Keys/indexes changed")
                 if ch["options_changed"]:
@@ -331,8 +383,10 @@ def render_markdown(meta: Dict[str, Any], erd_block: str, diffs: Optional[Dict[s
                 if ch.get("row_size_change"):
                     rsc = ch["row_size_change"]
                     if meta.get("flavor") == "postgres":
-                        lines.append(f"  - Rows: {rsc.get('row_count_baseline')} → {rsc.get('row_count_current')} ({(rsc.get('row_count_delta_pct') or 0):.2f}%){' ⚠️' if rsc.get('row_count_flag') else ''}")
-                        lines.append(f"  - Size: {human_bytes(rsc.get('size_baseline'))} → {human_bytes(rsc.get('size_current'))} ({(rsc.get('size_delta_pct') or 0):.2f}%){' ⚠️' if rsc.get('size_flag') else ''}")
+                        rc = rsc.get('row_count_delta_pct')
+                        sc = rsc.get('size_delta_pct')
+                        lines.append(f"  - Rows: {rsc.get('row_count_baseline')} → {rsc.get('row_count_current')} ({(rc or 0):.2f}%){' ⚠️' if rsc.get('row_count_flag') else ''}")
+                        lines.append(f"  - Size: {human_bytes(rsc.get('size_baseline'))} → {human_bytes(rsc.get('size_current'))} ({(sc or 0):.2f}%){' ⚠️' if rsc.get('size_flag') else ''}")
                     else:
                         lines.append(f"  - Rows: {rsc.get('num_rows_baseline')} → {rsc.get('num_rows_current')} ({(rsc.get('row_count_delta_pct') or 0):.2f}%)")
         else:
@@ -367,25 +421,36 @@ def render_markdown(meta: Dict[str, Any], erd_block: str, diffs: Optional[Dict[s
             lines.append(f"- Table type: **{tinfo.get('table_type')}**")
             lines.append(f"- Rows: **{tinfo.get('num_rows','n/a')}**")
             if tinfo.get("partitioning"):
-                lines.append(f"- Partitioning: `{tinfo['partitioning']}` on `{tinfo.get('partition_field')}`")
+                pf = tinfo.get('partition_field') or 'ingestion_time'
+                lines.append(f"- Partitioning: `{tinfo['partitioning']}` on `{pf}`")
             if tinfo.get("clustering_fields"):
                 lines.append(f"- Clustering: `{', '.join(tinfo['clustering_fields'])}`")
             lines.append("\n### Columns")
             lines.append("| name | data_type | mode | description |")
             lines.append("|---|---|---|---|")
             for c in tinfo["columns"]:
-                lines.append(f"| {c['name']} | {c['data_type']} | {c.get('mode','')} | {c.get('description','') or ''} |")
+                lines.append(f"| {c['name']} | {c['data_type']} | {c.get('mode','') or ''} | {c.get('description','') or ''} |")
     return "\n".join(lines)
 
 def render_html(meta, erd_block, diffs):
-    # Ensure Mermaid renders by embedding the script and using <div class="mermaid">.
+    # Jinja-rich template; fallback adds minimal details
     if jinja2 is None:
         erd_html = f'<div class="mermaid">{erd_block}</div>' if erd_block else ""
+        # Minimal table listing in fallback
+        tbls = []
+        for tname, tinfo in meta["tables"].items():
+            if meta.get("flavor") == "postgres":
+                tbls.append(f"<h3>{tname}</h3><ul><li>Approx rows: {tinfo.get('approx_rows','n/a')}</li><li>Size: {human_bytes(tinfo.get('size_bytes'))}</li></ul>")
+            else:
+                pf = tinfo.get('partition_field') or 'ingestion_time' if tinfo.get("partitioning") else ''
+                ptxt = f"<li>Partitioning: {tinfo.get('partitioning')} on {pf}</li>" if tinfo.get("partitioning") else ""
+                ctxt = f"<li>Clustering: {', '.join(tinfo.get('clustering_fields', []))}</li>" if tinfo.get("clustering_fields") else ""
+                tbls.append(f"<h3>{tname}</h3><ul><li>Rows: {tinfo.get('num_rows','n/a')}</li>{ptxt}{ctxt}</ul>")
         return f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
-<title>Metadata Auto-Doc v0.3.1</title>
+<title>Metadata Auto-Doc v0.4</title>
 <style>
 body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; }}
 table {{ border-collapse: collapse; width: 100%; margin-bottom: 16px; }}
@@ -398,15 +463,18 @@ th {{ background: #f6f6f6; }}
 <script>mermaid.initialize({{ startOnLoad: true }});</script>
 </head>
 <body>
-<h1>Metadata Auto-Doc <span class="small">(v0.3.1)</span></h1>
+<h1>Metadata Auto-Doc <span class="small">(v0.4)</span></h1>
 {erd_html}
+{''.join(tbls)}
 </body></html>"""
 
-    tpl = jinja2.Template("""<!doctype html>
+    env = jinja2.Environment(autoescape=True)
+    env.globals["human_bytes"] = human_bytes
+    tpl = env.from_string("""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
-<title>Metadata Auto-Doc v0.3.1</title>
+<title>Metadata Auto-Doc v0.4</title>
 <style>
 body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; }
 table { border-collapse: collapse; width: 100%; margin-bottom: 16px; }
@@ -420,7 +488,7 @@ code { background: #f7f7f7; padding: 2px 4px; border-radius: 4px; }
 <script>mermaid.initialize({ startOnLoad: true });</script>
 </head>
 <body>
-<h1>Metadata Auto-Doc <span class="small">(v0.3.1)</span></h1>
+<h1>Metadata Auto-Doc <span class="small">(v0.4)</span></h1>
 <p>
   {% if meta.flavor == 'postgres' %}
     <strong>Schema:</strong> {{ meta.schema }}
@@ -457,8 +525,8 @@ code { background: #f7f7f7; padding: 2px 4px; border-radius: 4px; }
       {% if ch.options_changed %}<li>Options changed: <code>{{ ch.options_changed|join(', ') }}</code></li>{% endif %}
       {% if ch.row_size_change %}
         {% if meta.flavor == 'postgres' %}
-          <li>Rows: {{ ch.row_size_change.row_count_baseline }} → {{ ch.row_size_change.row_count_current }} ({{ '%.2f'|format(ch.row_size_change.row_count_delta_pct or 0) }}%)</li>
-          <li>Size: {{ ch.row_size_change.size_baseline|default('') }} → {{ ch.row_size_change.size_current|default('') }}</li>
+          <li>Rows: {{ ch.row_size_change.row_count_baseline }} → {{ ch.row_size_change.row_count_current }} ({{ '%.2f'|format(ch.row_size_change.row_count_delta_pct or 0) }}%) {% if ch.row_size_change.row_count_flag %}⚠️{% endif %}</li>
+          <li>Size: {{ human_bytes(ch.row_size_change.size_baseline) }} → {{ human_bytes(ch.row_size_change.size_current) }} ({{ '%.2f'|format(ch.row_size_change.size_delta_pct or 0) }}%) {% if ch.row_size_change.size_flag %}⚠️{% endif %}</li>
         {% else %}
           <li>Rows: {{ ch.row_size_change.num_rows_baseline }} → {{ ch.row_size_change.num_rows_current }} ({{ '%.2f'|format(ch.row_size_change.row_count_delta_pct or 0) }}%)</li>
         {% endif %}
@@ -479,7 +547,7 @@ code { background: #f7f7f7; padding: 2px 4px; border-radius: 4px; }
     {% if tinfo.comment %}<p>{{ tinfo.comment }}</p>{% endif %}
     <ul>
       <li>Approx rows: <strong>{{ tinfo.approx_rows or 'n/a' }}</strong></li>
-      <li>Size: <strong>{{ tinfo.size_bytes or 'n/a' }}</strong></li>
+      <li>Size: <strong>{{ human_bytes(tinfo.size_bytes) }}</strong></li>
       {% if tinfo.primary_key %}<li>Primary key: <code>{{ tinfo.primary_key|join(', ') }}</code></li>{% endif %}
       {% if tinfo.foreign_keys %}
         <li>Foreign keys:
@@ -513,7 +581,7 @@ code { background: #f7f7f7; padding: 2px 4px; border-radius: 4px; }
     <ul>
       <li>Table type: <strong>{{ tinfo.table_type }}</strong></li>
       <li>Rows: <strong>{{ tinfo.num_rows or 'n/a' }}</strong></li>
-      {% if tinfo.partitioning %}<li>Partitioning: <code>{{ tinfo.partitioning }}</code> on <code>{{ tinfo.partition_field }}</code></li>{% endif %}
+      {% if tinfo.partitioning %}<li>Partitioning: <code>{{ tinfo.partitioning }}</code> on <code>{{ tinfo.partition_field or 'ingestion_time' }}</code></li>{% endif %}
       {% if tinfo.clustering_fields %}<li>Clustering: <code>{{ tinfo.clustering_fields|join(', ') }}</code></li>{% endif %}
     </ul>
     <table>
@@ -571,22 +639,37 @@ def main():
 
     ap.add_argument("--threshold-row-pct", type=float, default=10.0, help="Flag Postgres row count changes above this percent")
     ap.add_argument("--threshold-size-pct", type=float, default=10.0, help="Flag Postgres size changes above this percent")
-    ap.add_argument("--threshold-col-desc", action="store_true", help="Flag column description/comment changes")
+    ap.add_argument("--threshold-col-desc", action="store_true", help="Include column description/comment diffs")
 
+    ap.add_argument("--include-tables", help="Regex filter to include table names (apply before collect output)")
+    ap.add_argument("--exclude-tables", help="Regex filter to exclude table names")
+    ap.add_argument("--no-erd", action="store_true", help="Skip Mermaid ERD block generation")
     ap.add_argument("--slack-webhook", help="Slack webhook URL for summary notification (optional)")
+    ap.add_argument("--fail-on-significant", action="store_true", help="Exit with non-zero code if significant changes detected")
+
     args = ap.parse_args()
 
+    # Validate option combinations
     if args.source == "postgres":
         if not (args.conn and args.schema):
             raise SystemExit("--conn and --schema are required for Postgres")
-        meta = pg_collect(args.conn, args.schema)
     else:
         if not (args.project and args.dataset):
             raise SystemExit("--project and --dataset are required for BigQuery")
-        meta = bq_collect(args.project, args.dataset)
+        if args.conn or args.schema:
+            print("Note: --conn/--schema are ignored for BigQuery", file=sys.stderr)
+
+    ok_table = _compile_filters(args.include_tables, args.exclude_tables)
+
+    if args.source == "postgres":
+        meta = pg_collect(args.conn, args.schema, ok_table)
+    else:
+        meta = bq_collect(args.project, args.dataset, ok_table)
 
     # ERD
-    erd_block = mermaid_from_pg(meta) if meta.get("flavor") == "postgres" else mermaid_from_bq(meta)
+    erd_block = ""
+    if not args.no_erd:
+        erd_block = mermaid_from_pg(meta) if meta.get("flavor") == "postgres" else mermaid_from_bq(meta)
 
     # Snapshots
     ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -606,11 +689,14 @@ def main():
 
     # Pick baseline
     baseline = None
+    baseline_path = None
     if args.baseline:
         try:
             with open(args.baseline, "r") as f:
                 baseline = json.load(f)
-        except Exception:
+                baseline_path = args.baseline
+        except Exception as e:
+            print(f"Failed to load baseline {args.baseline}: {e}", file=sys.stderr)
             baseline = None
     elif args.snapshot_dir:
         # pick most recent prior
@@ -621,8 +707,11 @@ def main():
             try:
                 with open(baseline_path, "r") as f:
                     baseline = json.load(f)
-            except Exception:
+            except Exception as e:
+                print(f"Failed to load previous snapshot {baseline_path}: {e}", file=sys.stderr)
                 baseline = None
+        else:
+            print(f"No previous snapshot found in {args.snapshot_dir}; skipping diff.", file=sys.stderr)
 
     # Diff
     diffs = None
@@ -641,11 +730,21 @@ def main():
         with open(args.html, "w") as f:
             f.write(html)
 
-    # Slack notify if significant
-    if args.slack_webhook and diffs and (diffs.get("summary", {}).get("significant") or diffs.get("tables_added") or diffs.get("tables_removed")):
-        notify_slack(args.slack_webhook, "Metadata changes detected:\n" + summarize_diffs(diffs))
-
+    # Slack notify if significant or any add/remove
+    exit_code = 0
+    if diffs:
+        significant = (diffs.get("summary", {}).get("significant")
+                       or bool(diffs.get("tables_added"))
+                       or bool(diffs.get("tables_removed")))
+        if args.slack_webhook and significant:
+            title_line = (f"Postgres schema {meta.get('schema')}" if meta.get("flavor") == "postgres"
+                          else f"BigQuery {meta.get('project')}.{meta.get('dataset')}")
+            sev = "🚨" if diffs.get("summary",{}).get("significant") else "ℹ️"
+            notify_slack(args.slack_webhook, f"{sev} Metadata changes in {title_line}\n" + summarize_diffs(diffs))
+        if args.fail_on_significant:
+            exit_code = 1  # CI gate
     print("Done.")
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
