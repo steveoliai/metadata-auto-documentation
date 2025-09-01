@@ -1,87 +1,80 @@
-# Metadata Auto-Doc v0.3
-![Python](https://img.shields.io/badge/Python-3.9+-blue)
+# Metadata Auto-Doc v0.4
 
-*Auto-generate database documentation, ERDs, and schema diffs.*
+Metadata Auto-Doc is a Python utility that automatically documents database schemas (Postgres, BigQuery), generates ER diagrams, and tracks schema changes across runs.
 
----
+## Features
+- **Supports Postgres and BigQuery**
+- **Outputs**: Markdown, HTML (with Mermaid ERD), JSON snapshots
+- **Schema Diffing**: Highlights added/removed/changed tables and columns
+- **Snapshot Management**: Compare with previous runs to detect changes
+- **Slack Notifications**: Optional webhook integration
+- **Filters**: Include/exclude tables by regex
+- **CI/CD Ready**: Fail with non-zero exit code on significant diffs
 
-## Overview
-The **Metadata Auto-Doc Tool** creates living documentation directly from your database or warehouse, supporting **PostgreSQL** and **BigQuery**.
+## Requirements
 
-**Key Features:**
-- Extracts schema metadata with columns, relationships, and statistics
-- Outputs documentation in **Markdown** and **HTML** formats
-- Generates **Mermaid ER diagrams** with foreign key relationships
-- Tracks **schema changes** between runs with configurable thresholds
-- Stores **timestamped JSON snapshots** for historical analysis
-- Optional **Slack alerts** for significant changes
+Install dependencies from `requirements.txt`:
 
-**v0.3 Enhancements:**
-- HTML output with styled tables
-- Auto-baseline selection from previous snapshots
-- Enhanced change tracking with customizable thresholds
-
----
-
-## Installation
 ```bash
-git clone https://github.com/your-org/metadata-autodoc.git
-cd metadata-autodoc
-python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
----
+## Usage
+
+### Postgres Example
+
+```bash
+python metadata_autodoc.py --source postgres   --conn postgresql+psycopg2://user:pass@host:5432/db   --schema public   --md docs.md --html docs.html --json snapshot.json   --snapshot-dir ./_snapshots
+```
+
+### BigQuery Example
+
+```bash
+python metadata_autodoc.py --source bigquery   --project my-proj --dataset my_ds   --md docs.md --html docs.html --json snapshot.json   --snapshot-dir ./_snapshots
+```
+
+## Options
+
+| Option | Description |
+|--------|-------------|
+| `--source {postgres,bigquery}` | Required: choose database type |
+| `--conn` | SQLAlchemy connection string (Postgres only) |
+| `--schema` | Schema name (Postgres only) |
+| `--project` | BigQuery project (BigQuery only) |
+| `--dataset` | BigQuery dataset (BigQuery only) |
+| `--md` | Path to write Markdown documentation |
+| `--html` | Path to write HTML documentation |
+| `--json` | Path to write current snapshot JSON |
+| `--snapshot-dir` | Directory to store timestamped snapshots |
+| `--baseline` | Path to baseline JSON (overrides auto-pick) |
+| `--threshold-row-pct` | Row count change threshold (%) [default=10] |
+| `--threshold-size-pct` | Size change threshold (%) [default=10] |
+| `--threshold-col-desc` | Include column description/comment diffs |
+| `--include-tables` | Regex filter for table names to include |
+| `--exclude-tables` | Regex filter for table names to exclude |
+| `--no-erd` | Skip Mermaid ERD block |
+| `--slack-webhook` | Slack webhook URL for summary notification |
+| `--fail-on-significant` | Exit with non-zero status if significant changes detected |
+
+## Snapshots & Diffs
+
+- Each run can write a timestamped snapshot (`--snapshot-dir`).
+- If snapshots exist, the most recent prior run is used as baseline unless `--baseline` is provided.
+- Diffs are included in Markdown/HTML outputs and can trigger Slack notifications.
+
+## Slack Notifications
+
+If `--slack-webhook` is provided, a short summary of schema changes is posted. Significant diffs are marked with 🚨.
 
 ## Quick Start
 
-### PostgreSQL
-```bash
-python metadata_autodoc.py --source postgres \
-  --conn postgresql+psycopg2://user:pass@host:5432/db \
-  --schema public \
-  --md docs.md --html docs.html --json snapshot.json \
-  --snapshot-dir ./_snapshots
-```
-
-### BigQuery
-```bash
-# Ensure GOOGLE_APPLICATION_CREDENTIALS is set
-python metadata_autodoc.py --source bigquery \
-  --project my-project --dataset my_dataset \
-  --md docs.md --html docs.html --json snapshot.json \
-  --snapshot-dir ./_snapshots
-```
+1. Install requirements: `pip install -r requirements.txt`
+2. Run against your database (see examples above)
+3. Open the generated `docs.html` in a browser to see the ERD and schema docs
 
 ---
 
-## Configuration Options
 
-### Data Sources
-- `--source postgres` requires `--conn` and `--schema`
-- `--source bigquery` requires `--project` and `--dataset`
-
-### Output Formats
-- `--md <path>` → Markdown documentation
-- `--html <path>` → Styled HTML documentation  
-- `--json <path>` → Current snapshot JSON
-- `--snapshot-dir <dir>` → Timestamped snapshots for change tracking
-
-### Change Detection
-- `--baseline <path>` → Specific snapshot file to compare against
-- If omitted with `--snapshot-dir`, automatically uses the most recent snapshot
-
-### Thresholds (defaults shown)
-```bash
---threshold-row-pct 10        # Flag row count changes > 10% (Postgres)
---threshold-size-pct 10       # Flag table size changes > 10% (Postgres) 
---threshold-col-desc          # Flag column description changes
-```
-
-### Notifications
-- `--slack-webhook <url>` → Send change summary to Slack
-
----
 
 ## Advanced Example
 ```bash
