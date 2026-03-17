@@ -57,6 +57,8 @@ def pct_change(cur: Optional[float], base: Optional[float]) -> Optional[float]:
     if base == 0: return None
     return ((cur - base) / base) * 100.0
 
+_MM_RESERVED = {"pk", "fk", "uk"}
+
 def _mm_sanitize(name: str) -> str:
     """Sanitize names for Mermaid erDiagram block."""
     s = re.sub(r'[^a-zA-Z0-9_]', '_', name or '')
@@ -64,6 +66,8 @@ def _mm_sanitize(name: str) -> str:
         s = 'unnamed'
     if s[0].isdigit():
         s = f"t_{s}"
+    if s.lower() in _MM_RESERVED:
+        s = f"{s}_col"
     return s
 
 def _compile_filters(include: Optional[str], exclude: Optional[str]):
@@ -253,7 +257,7 @@ def mermaid_from_pg(meta: Dict[str, Any]) -> str:
         for fk in tinfo.get("foreign_keys", []):
             ft = fk["foreign_table_name"]
             if ft in meta["tables"]:
-                lines.append(f"  {_mm_sanitize(ft)} ||--o{{ {_mm_sanitize(tname)} : FK")
+                lines.append(f'  {_mm_sanitize(ft)} ||--o{{ {_mm_sanitize(tname)} : "FK"')
     return "\n".join(lines)
 
 def mermaid_from_bq(meta: Dict[str, Any]) -> str:
